@@ -96,7 +96,7 @@ module.exports = async (req, res) => {
                 start(controller) {
                     return pump();
                     function pump() {
-                        return reader.read().键，然后(({ done, value }) => {
+                        return reader.read().then(({ done, value }) => {
                             if (done) { controller.close(); return; }
                             controller.enqueue(value);
                             return pump();
