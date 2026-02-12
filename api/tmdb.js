@@ -1,118 +1,143 @@
-// 移除 axios 依赖，使用原生 fetch (Node.js 18+)
-const TMDB_BASE_URL = 'https://api.themoviedb.org';
+const { pipeline } = require('stream/promises'); // Node.js 流处理工具
 
-// 配置常量
-const CACHE_DURATION = 10 * 60 * 1000; // 10分钟
+// 配置
+const API_BASE_URL = 'https://api.themoviedb.org';
+const IMG_BASE_URL = 'https://image.tmdb.org';
+
+// 缓存配置 (仅针对 API JSON 数据)
+const CACHE_DURATION = 10 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
 
-// 使用 Map 作为 LRU 缓存 (Map 会按照插入顺序保存 Key)
-const cache = new Map();
-
-/**
- * 写入缓存并强制执行 LRU 策略 (删除最久未使用的)
- */
-function setCache(key, data) {
-    // 如果键已存在，先删除以更新其在 Map 中的位置（移到最后）
-    if (cache.has(key)) {
-        cache.delete(key);
+// --- 1. 请求管理器 (复用之前的逻辑，处理 API 缓存) ---
+class RequestManager {
+    constructor() {
+        this.dataCache = new Map();
+        this.pendingRequests = new Map();
     }
 
-    // 如果超出大小，删除最旧的元素 (Map.keys().next() 获取的是第一个插入的元素)
-    if (cache.size >= MAX_CACHE_SIZE) {
-        const oldestKey = cache.keys().下一处()。value;
-        cache.delete(oldestKey);
+    async fetch(key, fetcherFn) {
+        // A. 读缓存
+        const cached = this._getFromDataCache(key);
+        if (cached) return cached;
+
+        // B. 请求合并
+        if (this.pendingRequests.has(key)) return this.pendingRequests.get(key);
+
+        // C. 发起网络请求
+        const promise = fetcherFn()
+            .then(data => {
+                this._setToDataCache(key, data);
+                return data;
+            })
+            .finally(() => this.pendingRequests.delete(key));
+
+        this.pendingRequests.set(key, promise);
+        return promise;
     }
 
-    cache.set(key, {
-        data,
-        expiry: Date.当前() + CACHE_DURATION
-    });
+    _getFromDataCache(key) {
+        const item = this.dataCache.get(key);
+        if (!item) return null;
+        if (Date.now() > item.expiry) {
+            this.dataCache.delete(key);
+            return null;
+        }
+        // LRU 刷新
+        this.dataCache.delete(key);
+        this.dataCache.set(key, item);
+        return item.data;
+    }
+
+    _setToDataCache(key, data) {
+        if (this.dataCache.size >= MAX_CACHE_SIZE) {
+            this.dataCache.delete(this.dataCache.keys().next().value);
+        }
+        this.dataCache.set(key, { data, expiry: Date.now() + CACHE_DURATION });
+    }
 }
 
-/**
- * 获取缓存
- * 包含惰性过期检查
- */
-function getCache(key) {
-    const item = cache.get(key);
-    if (!item) return null;
+const manager = new RequestManager();
 
-    // 检查过期
-    if (Date.当前() > item.expiry) {
-        cache.delete(key);
-        return null;
-    }
-
-    // LRU 核心机制：读取命中后，重新 set 一次，将其移到 Map 末尾（表示最近刚被使用）
-    // 注意：如果你只想做 TTL (Time To Live) 而不关心 LRU，可以注释掉下面这行
-    cache.delete(key);
-    cache.set(key, item); 
-
-    return item.data;
-}
+// --- 2. 主处理函数 ---
 
 module.exports = async (req, res) => {
-    // 1. 设置 CORS (保持原样)
+    // CORS 设置
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
 
     try {
         const fullPath = req.url;
-        const authHeader = req.headers.authorization;
-        const cacheKey = fullPath; // 可以考虑加入 authHeader 作为 key 的一部分以区分用户
+        
+        // --- 路由判断核心逻辑 ---
+        
+        // 情况 A: 图片请求 (路径通常包含 /t/p/w500/...)
+        // 图片不需要 JS 内存缓存 (体积大，且浏览器自带缓存)，直接流式透传
+        if (fullPath.startsWith('/t/p/') || fullPath.startsWith('/t/original/')) {
+            console.log('🖼️ [Image Proxy]:', fullPath);
+            
+            const imgUrl = `${IMG_BASE_URL}${fullPath}`;
+            const imgResponse = await fetch(imgUrl);
 
-        // 2. 检查缓存
-        const cachedData = getCache(cacheKey);
-        if (cachedData) {
-            console.log('Cache hit:', fullPath);
-            // 这里显式设置 Content-Type，防止客户端解析错误
-            res.setHeader('Content-Type', 'application/json');
-            return res.status(200).send(JSON.stringify(cachedData));
+            if (!imgResponse.ok) {
+                return res.status(imgResponse.status).end();
+            }
+
+            // 转发 Content-Type (如 image/jpeg) 和 Cache-Control
+            res.setHeader('Content-Type', imgResponse.headers.get('content-type'));
+            res.setHeader('Cache-Control', 'public, max-age=31536000'); // 让浏览器缓存图片一年
+
+            // 将 Web Stream 转换为 Node Stream 并管道传输给响应
+            // 注意：Node 18+ 的 fetch body 是 Web ReadableStream
+            const reader = imgResponse.body.getReader();
+            const stream = new ReadableStream({
+                start(controller) {
+                    return pump();
+                    function pump() {
+                        return reader.read().键，然后(({ done, value }) => {
+                            if (done) { controller.close(); return; }
+                            controller.enqueue(value);
+                            return pump();
+                        });
+                    }
+                }
+            });
+            
+            // 下面是一种将 Web Stream 转为 Node Stream 的简便方法，或者直接把 Buffer 写回
+            const buffer = await imgResponse.arrayBuffer();
+            return res.status(200).send(Buffer.from(buffer));
         }
 
-        // 3. 构建请求
-        const tmdbUrl = `${TMDB_BASE_URL}${fullPath}`;
-        const headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-        if (authHeader) {
-            headers['Authorization'] = authHeader;
-        }
+        // 情况 B: API 请求 (走缓存 + 请求合并)
+        console.log('📝 [API Proxy]:', fullPath);
+        
+        const apiData = await manager.fetch(fullPath, async () => {
+            const apiUrl = `${API_BASE_URL}${fullPath}`;
+            const headers = { 
+                'Accept': 'application/json',
+                'Content-Type': 'application/json' 
+            };
+            if (req.headers.authorization) {
+                headers['Authorization'] = req.headers.authorization;
+            }
 
-        // 4. 发送原生 fetch 请求
-        const response = await fetch(tmdbUrl, {
-            method: 'GET',
-            headers: headers
+            const response = await fetch(apiUrl, { headers });
+            
+            if (!response.ok) {
+                const txt = await response.text();
+                throw new Error(txt || response.statusText);
+            }
+            
+            return await response.json();
         });
 
-        // 5. 处理响应
-        if (!response.ok) {
-            // 透传错误状态码
-            const errorData = await response.text(); // 使用 text 以防万一 TMDB 返回非 JSON
-            console.warn(`TMDB API Error: ${response.status} ${response.statusText}`);
-            return res.status(response.status).send(errorData);
-        }
-
-        const data = await response.json();
-
-        // 6. 写入缓存 (仅在成功时)
-        setCache(cacheKey, data);
-        console.log('Cache miss - Stored:', fullPath);
-
         res.setHeader('Content-Type', 'application/json');
-        res.status(200).send(JSON.stringify(data));
+        res.status(200).send(JSON.stringify(apiData));
 
     } catch (error) {
         console.error('Proxy Error:', error);
-        res.status(500).json({
-            error: 'Internal Server Error',
-            message: error.message
-        });
+        res.status(500).json({ error: 'Proxy Error', details: error.message });
     }
 };
